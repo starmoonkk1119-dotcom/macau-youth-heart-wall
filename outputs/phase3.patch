@@ -1,0 +1,562 @@
+--- a/app.py
++++ b/app.py
+@@ -1,15 +1,50 @@
+ """Streamlit interface. Run with: streamlit run app.py"""
+ 
+ from datetime import datetime, timedelta, timezone
++import hashlib
++import hmac
++import os
+ import sqlite3
+ 
+ import streamlit as st
+ 
+ from ai import analyze_post, normalize_text
+-from db import MAX_CONTENT_LENGTH, create_post, get_approved_posts, init_db
++from db import (
++    MAX_CONTENT_LENGTH,
++    add_reaction,
++    create_post,
++    create_reply,
++    get_approved_posts,
++    get_approved_replies,
++    get_reaction_counts,
++    get_review_posts,
++    get_review_replies,
++    init_db,
++    review_item,
++)
+ 
+ 
+ MACAU_TIMEZONE = timezone(timedelta(hours=8))
++HELP_RESOURCES = (
++    "如果你现在很难受，请联系澳门明爱生命热线 28525222，"
++    "或向信任的大人/学校社工求助。你并不孤单。"
++)
++REACTION_LABELS = (
++    ("understand", "我懂你"),
++    ("hug", "抱抱"),
++    ("metoo", "我也是"),
++    ("worried", "我有点担心你"),
++)
++
++
++def show_help_resources() -> None:
++    st.error(HELP_RESOURCES)
++
++
++def format_time(value: str) -> str:
++    return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(
++        MACAU_TIMEZONE
++    ).strftime("%Y-%m-%d %H:%M")
+ 
+ 
+ def write_post_page() -> None:
+@@ -30,6 +65,7 @@
+                 "这条心声需要优先安全关注，不会公开。"
+                 "本网站不是实时求助渠道，不能保证有人即时查看。"
+             )
++            show_help_resources()
+         else:
+             st.caption("当前状态：待人工审核。")
+         with st.container(border=True):
+@@ -56,7 +92,11 @@
+                 raise ValueError(f"心声最多支持 {MAX_CONTENT_LENGTH} 个字符。")
+             with st.spinner("正在接住你的心声……"):
+                 analysis = analyze_post(content)
+-                status = "crisis" if analysis["moderation"] == "crisis" else "pending"
++                status = (
++                    "crisis"
++                    if analysis["moderation"] == "crisis" or analysis["intensity"] >= 4
++                    else "pending"
++                )
+                 post_id = create_post(
+                     content, consent_public,
+                     category=analysis["category"],
+@@ -78,30 +118,243 @@
+             st.rerun()
+ 
+ 
++def reaction_buttons(post_id: int, counts: dict[str, int]) -> None:
++    for offset in (0, 2):
++        columns = st.columns(2)
++        for column, (reaction_type, label) in zip(
++            columns, REACTION_LABELS[offset:offset + 2]
++        ):
++            if column.button(
++                f"{label} · {counts[reaction_type]}",
++                key=f"reaction_{post_id}_{reaction_type}",
++                use_container_width=True,
++            ):
++                try:
++                    crisis = add_reaction(post_id, reaction_type)
++                    st.session_state["_wall_notice"] = {
++                        "message": (
++                            f"心声 #{post_id} 已转入优先安全关注，暂时退出公开墙。"
++                            if crisis else f"已为心声 #{post_id} 留下一份关怀。"
++                        ),
++                        "help": crisis,
++                    }
++                except (ValueError, sqlite3.Error):
++                    st.session_state["_wall_notice"] = {
++                        "message": "关怀暂未保存，帖子可能已退出公开墙，请刷新后重试。",
++                        "error": True,
++                    }
++                st.rerun()
++
++
++def reply_form(post_id: int) -> None:
++    draft_key = f"reply_draft_{post_id}"
++    with st.form(f"reply_form_{post_id}", clear_on_submit=False, border=False):
++        content = st.text_area(
++            "留下一点安慰",
++            key=draft_key,
++            max_chars=MAX_CONTENT_LENGTH,
++            height=100,
++        )
++        submitted = st.form_submit_button("提交回复")
++    if submitted:
++        try:
++            if not normalize_text(content):
++                raise ValueError("请先写下一点安慰，再提交。")
++            if len(content.strip()) > MAX_CONTENT_LENGTH:
++                raise ValueError(f"回复最多支持 {MAX_CONTENT_LENGTH} 个字符。")
++            with st.spinner("正在检查回复……"):
++                analysis = analyze_post(content)
++                create_reply(post_id, content, moderation=analysis["moderation"])
++        except ValueError as error:
++            st.error(str(error))
++        except sqlite3.Error:
++            st.error("暂时无法保存回复，输入已保留，请稍后重试。")
++        else:
++            st.session_state["_clear_reply_draft"] = draft_key
++            st.session_state["_wall_notice"] = {
++                "message": f"心声 #{post_id} 的回复已提交，等待人工审核，尚未公开。",
++                "help": analysis["moderation"] == "crisis",
++            }
++            st.rerun()
++
++
+ def wall_page() -> None:
+     st.title("心声墙")
+-    st.caption("每一份感受，都值得被认真对待。")
++    st.caption(
++        "每一份感受，都值得被认真对待。"
++        "回复正文将发送至 DeepSeek 分析，请勿填写身份信息。"
++    )
++    clear_key = st.session_state.pop("_clear_reply_draft", None)
++    if clear_key:
++        st.session_state[clear_key] = ""
++    notice = st.session_state.pop("_wall_notice", None)
++    if notice:
++        if notice.get("error"):
++            st.error(notice["message"])
++        else:
++            st.success(notice["message"])
++        if notice.get("help"):
++            show_help_resources()
++            st.caption("本网站不是实时求助渠道，不能保证有人即时查看。")
+     try:
+         posts = get_approved_posts()
++        if not posts:
++            st.info("心声墙暂时还没有可以公开的心声。")
++        for post in posts:
++            counts = get_reaction_counts(post["id"])
++            replies = get_approved_replies(post["id"])
++            with st.container(border=True):
++                st.caption(
++                    f"匿名心声 #{post['id']} · "
++                    f"{format_time(post['created_at'])}（澳门时间）"
++                )
++                st.text(post["content"])
++                if (post["intensity"] or 0) >= 4 or counts["worried"] >= 3:
++                    show_help_resources()
++                reaction_buttons(post["id"], counts)
++                st.divider()
++                for reply in replies:
++                    st.caption(
++                        f"匿名回复 #{reply['id']} · "
++                        f"{format_time(reply['created_at'])}（澳门时间）"
++                    )
++                    st.text(reply["content"])
++                if not replies:
++                    st.caption("还没有已通过的回复。")
++                reply_form(post["id"])
+     except sqlite3.Error:
+-        st.error("暂时无法读取心声，请稍后重试。")
++        st.error("暂时无法读取心声或回复，请稍后重试。")
++
++
++def admin_authenticated() -> bool:
++    expected = os.environ.get("ADMIN_PASS", "")
++    token = st.session_state.get("_admin_token")
++    return (
++        bool(expected.strip())
++        and isinstance(token, bytes)
++        and hmac.compare_digest(
++            token, hashlib.sha256(expected.encode("utf-8")).digest()
++        )
++    )
++
++
++def check_admin_password() -> None:
++    entered = st.session_state.pop("admin_password", "")
++    expected = os.environ.get("ADMIN_PASS", "")
++    if expected.strip() and hmac.compare_digest(
++        entered.encode("utf-8"), expected.encode("utf-8")
++    ):
++        st.session_state["_admin_token"] = hashlib.sha256(
++            expected.encode("utf-8")
++        ).digest()
++        st.session_state.pop("_admin_login_error", None)
++    else:
++        st.session_state.pop("_admin_token", None)
++        st.session_state["_admin_login_error"] = True
++
++
++def logout_admin() -> None:
++    for key in ("_admin_token", "_admin_login_error", "_admin_notice"):
++        st.session_state.pop(key, None)
++
++
++def review_buttons(kind: str, item_id: int) -> None:
++    columns = st.columns(2)
++    approved = columns[0].button(
++        "通过", key=f"approve_{kind}_{item_id}", type="primary"
++    )
++    rejected = columns[1].button("退回", key=f"reject_{kind}_{item_id}")
++    if approved or rejected:
++        if not admin_authenticated():
++            st.error("管理员登录已失效，请重新登录。")
++            return
++        try:
++            changed = review_item(
++                kind, item_id, "approved" if approved else "rejected"
++            )
++            st.session_state["_admin_notice"] = {
++                "message": "审核结果已保存。" if changed else "该内容已被处理，请查看最新队列。"
++            }
++        except (ValueError, sqlite3.Error):
++            st.session_state["_admin_notice"] = {
++                "message": "审核结果暂未保存，请稍后重试。",
++                "error": True,
++            }
++        st.rerun()
++
++
++def admin_page() -> None:
++    st.title("管理员")
++    if not os.environ.get("ADMIN_PASS", "").strip():
++        logout_admin()
++        st.warning("尚未配置 ADMIN_PASS，管理员入口已关闭。")
+         return
+-
++    if not admin_authenticated():
++        st.session_state.pop("_admin_token", None)
++        with st.form("admin_login"):
++            st.text_input("管理员密码", type="password", key="admin_password")
++            st.form_submit_button("登录", on_click=check_admin_password)
++        if st.session_state.get("_admin_login_error"):
++            st.error("密码不正确，请重试。")
++        return
++
++    columns = st.columns(2)
++    if columns[0].button("刷新队列", key="refresh_admin"):
++        st.rerun()
++    columns[1].button("退出登录", key="logout_admin", on_click=logout_admin)
++    notice = st.session_state.pop("_admin_notice", None)
++    if notice:
++        if notice.get("error"):
++            st.error(notice["message"])
++        else:
++            st.success(notice["message"])
++    try:
++        posts = get_review_posts()
++        replies = get_review_replies()
++    except sqlite3.Error:
++        st.error("暂时无法读取审核队列，请稍后重试。")
++        return
++
++    st.subheader(f"待审核心声 · {len(posts)}")
+     if not posts:
+-        st.info("心声墙暂时还没有可以公开的心声。")
+-        return
+-
++        st.info("暂时没有待审核心声。")
+     for post in posts:
+         with st.container(border=True):
+-            created_at = datetime.fromisoformat(
+-                post["created_at"].replace("Z", "+00:00")
+-            ).astimezone(MACAU_TIMEZONE)
+             st.caption(
+-                f"匿名心声 #{post['id']} · "
+-                f"{created_at:%Y-%m-%d %H:%M}（澳门时间）"
+-            )
+-            # Render user content as literal text, never as HTML or Markdown.
++                f"心声 #{post['id']} · {format_time(post['created_at'])}（澳门时间）"
++            )
++            if post["status"] == "crisis":
++                st.error("危机 · 优先安全关注")
++                show_help_resources()
++            else:
++                st.caption("待人工审核")
+             st.text(post["content"])
++            st.caption(
++                f"分类：{post['category'] or '未分类'} · "
++                f"AI 参考强度：{post['intensity'] or '未评估'} · "
++                f"同意公开：{'是' if post['consent_public'] else '否'}"
++            )
++            if post["ai_reply"]:
++                st.caption("AI 陪伴回应")
++                st.text(post["ai_reply"])
++            review_buttons("post", post["id"])
++
++    st.subheader(f"待审核回复 · {len(replies)}")
++    if not replies:
++        st.info("暂时没有待审核回复。")
++    for reply in replies:
++        with st.container(border=True):
++            st.caption(
++                f"回复 #{reply['id']} → 心声 #{reply['post_id']} · "
++                f"{format_time(reply['created_at'])}（澳门时间）"
++            )
++            if reply["post_status"] == "crisis":
++                st.error("所属心声需要优先安全关注")
++            st.caption("所属心声")
++            st.text(reply["post_content"])
++            st.caption("待审核回复")
++            st.text(reply["content"])
++            review_buttons("reply", reply["id"])
+ 
+ 
+ def main() -> None:
+@@ -115,14 +368,18 @@
+     with st.sidebar:
+         st.title("心声墙")
+         st.caption("澳门青少年 · 匿名心声")
+-        page = st.radio("导航", ("写心声", "心声墙"), label_visibility="collapsed")
++        page = st.radio(
++            "导航", ("写心声", "心声墙", "管理员"), label_visibility="collapsed"
++        )
+         st.divider()
+         st.caption("请保护自己和他人的隐私。")
+ 
+     if page == "写心声":
+         write_post_page()
++    elif page == "心声墙":
++        wall_page()
+     else:
+-        wall_page()
++        admin_page()
+ 
+ 
+ if __name__ == "__main__":
+--- a/db.py
++++ b/db.py
+@@ -8,6 +8,13 @@
+ 
+ DB_PATH = Path(__file__).resolve().parent / "heart_wall.db"
+ MAX_CONTENT_LENGTH = 3000
++REACTION_TYPES = ("understand", "hug", "metoo", "worried")
++CRISIS_CONDITION = """
++    (intensity >= 4 OR (
++        SELECT COUNT(*) FROM reactions
++        WHERE reactions.post_id = posts.id AND type = 'worried'
++    ) >= 3)
++"""
+ 
+ 
+ @contextmanager
+@@ -65,8 +72,20 @@
+                 ON posts(status, consent_public, created_at DESC, id DESC);
+             CREATE INDEX IF NOT EXISTS idx_replies_post_id ON replies(post_id);
+             CREATE INDEX IF NOT EXISTS idx_reactions_post_id ON reactions(post_id);
+-            """
+-        )
++            CREATE INDEX IF NOT EXISTS idx_reactions_post_type
++                ON reactions(post_id, type);
++            """
++        )
++        # Upgrade existing phase 2 risks once, not after every manual approval.
++        connection.execute("BEGIN IMMEDIATE")
++        if connection.execute("PRAGMA user_version").fetchone()[0] < 1:
++            connection.execute(
++                f"""
++                UPDATE posts SET status = 'crisis'
++                WHERE status IN ('pending', 'approved') AND {CRISIS_CONDITION}
++                """
++            )
++            connection.execute("PRAGMA user_version = 1")
+ 
+ 
+ def create_post(
+@@ -111,7 +130,30 @@
+             """,
+             (content, category, intensity, ai_reply, status, int(consent_public)),
+         )
+-        return int(cursor.lastrowid)
++        post_id = int(cursor.lastrowid)
++        escalate_crisis_if_needed(post_id, connection=connection)
++        return post_id
++
++
++def escalate_crisis_if_needed(
++    post_id: int, *, connection: sqlite3.Connection | None = None
++) -> bool:
++    """Escalate pending/public posts; return whether the post is now crisis."""
++    if connection is None:
++        with _connection() as connection:
++            return escalate_crisis_if_needed(post_id, connection=connection)
++    connection.execute(
++        f"""
++        UPDATE posts SET status = 'crisis'
++        WHERE id = ? AND status IN ('pending', 'approved')
++          AND {CRISIS_CONDITION}
++        """,
++        (post_id,),
++    )
++    row = connection.execute(
++        "SELECT status FROM posts WHERE id = ?", (post_id,)
++    ).fetchone()
++    return row is not None and row["status"] == "crisis"
+ 
+ 
+ def get_approved_posts() -> list[sqlite3.Row]:
+@@ -119,7 +161,7 @@
+     with _connection() as connection:
+         return connection.execute(
+             """
+-            SELECT id, content, created_at
++            SELECT id, content, intensity, created_at
+             FROM posts
+             WHERE status = 'approved' AND consent_public = 1
+             ORDER BY created_at DESC, id DESC
+@@ -127,6 +169,128 @@
+         ).fetchall()
+ 
+ 
++def get_reaction_counts(post_id: int) -> dict[str, int]:
++    with _connection() as connection:
++        rows = connection.execute(
++            """
++            SELECT type, COUNT(*) AS count FROM reactions
++            WHERE post_id = ? GROUP BY type
++            """,
++            (post_id,),
++        ).fetchall()
++    counts = dict.fromkeys(REACTION_TYPES, 0)
++    counts.update({row["type"]: row["count"] for row in rows})
++    return counts
++
++
++def _require_public_post(connection: sqlite3.Connection, post_id: int) -> None:
++    row = connection.execute(
++        """
++        SELECT id FROM posts
++        WHERE id = ? AND status = 'approved' AND consent_public = 1
++        """,
++        (post_id,),
++    ).fetchone()
++    if row is None:
++        raise ValueError("这条心声已不在公开墙上，请刷新页面。")
++
++
++def add_reaction(post_id: int, reaction_type: str) -> bool:
++    """Insert and check escalation in one transaction; return crisis status."""
++    if reaction_type not in REACTION_TYPES:
++        raise ValueError("无效的关怀类型。")
++    with _connection() as connection:
++        connection.execute("BEGIN IMMEDIATE")
++        _require_public_post(connection, post_id)
++        connection.execute(
++            "INSERT INTO reactions(post_id, type) VALUES (?, ?)",
++            (post_id, reaction_type),
++        )
++        return escalate_crisis_if_needed(post_id, connection=connection)
++
++
++def create_reply(
++    post_id: int, content: str, *, moderation: str = "need_review"
++) -> int:
++    """All replies wait for review, including replies flagged by the AI."""
++    if not isinstance(content, str) or not content.strip():
++        raise ValueError("请先写下一点安慰，再提交。")
++    content = content.strip()
++    if len(content) > MAX_CONTENT_LENGTH:
++        raise ValueError(f"回复最多支持 {MAX_CONTENT_LENGTH} 个字符。")
++    if moderation not in ("safe", "need_review", "crisis"):
++        raise ValueError("回复审核结果无效。")
++    with _connection() as connection:
++        connection.execute("BEGIN IMMEDIATE")
++        _require_public_post(connection, post_id)
++        cursor = connection.execute(
++            """
++            INSERT INTO replies(post_id, content, status)
++            VALUES (?, ?, 'pending')
++            """,
++            (post_id, content),
++        )
++        if moderation == "crisis":
++            connection.execute(
++                "UPDATE posts SET status = 'crisis' WHERE id = ?", (post_id,)
++            )
++        return int(cursor.lastrowid)
++
++
++def get_approved_replies(post_id: int) -> list[sqlite3.Row]:
++    with _connection() as connection:
++        return connection.execute(
++            """
++            SELECT r.id, r.content, r.created_at
++            FROM replies AS r JOIN posts AS p ON p.id = r.post_id
++            WHERE r.post_id = ? AND r.status = 'approved'
++              AND p.status = 'approved' AND p.consent_public = 1
++            ORDER BY r.created_at, r.id
++            """,
++            (post_id,),
++        ).fetchall()
++
++
++def get_review_posts() -> list[sqlite3.Row]:
++    with _connection() as connection:
++        return connection.execute(
++            """
++            SELECT * FROM posts WHERE status IN ('pending', 'crisis')
++            ORDER BY CASE WHEN status = 'crisis' THEN 0 ELSE 1 END,
++                     created_at, id
++            """
++        ).fetchall()
++
++
++def get_review_replies() -> list[sqlite3.Row]:
++    with _connection() as connection:
++        return connection.execute(
++            """
++            SELECT r.*, p.content AS post_content, p.status AS post_status
++            FROM replies AS r JOIN posts AS p ON p.id = r.post_id
++            WHERE r.status = 'pending'
++            ORDER BY CASE WHEN p.status = 'crisis' THEN 0 ELSE 1 END,
++                     r.created_at, r.id
++            """
++        ).fetchall()
++
++
++def review_item(kind: str, item_id: int, new_status: str) -> bool:
++    """Only change items still in the queue, protecting against stale views."""
++    table = {"post": "posts", "reply": "replies"}.get(kind)
++    if table is None or new_status not in ("approved", "rejected"):
++        raise ValueError("无效的审核操作。")
++    with _connection() as connection:
++        cursor = connection.execute(
++            f"""
++            UPDATE {table} SET status = ?
++            WHERE id = ? AND status IN ('pending', 'crisis')
++            """,
++            (new_status, item_id),
++        )
++        return cursor.rowcount == 1
++
++
+ if __name__ == "__main__":
+     init_db()
+     print(f"Database ready: {DB_PATH}")

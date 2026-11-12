@@ -1,0 +1,977 @@
+"""Streamlit interface. Run with: streamlit run app.py"""
+
+from datetime import datetime, timedelta, timezone
+from html import escape
+import hashlib
+import hmac
+import os
+import sqlite3
+
+import streamlit as st
+
+from ai import analyze_post, normalize_text
+from db import (
+    MAX_CONTENT_LENGTH,
+    add_reaction,
+    create_post,
+    create_reply,
+    get_approved_posts,
+    get_approved_replies,
+    get_reaction_counts,
+    get_review_posts,
+    get_review_replies,
+    init_db,
+    review_item,
+)
+
+
+MACAU_TIMEZONE = timezone(timedelta(hours=8))
+TEXT = {
+    "zh": {
+        "language": "语言 · Language",
+        "language_zh": "中文",
+        "language_en": "English",
+        "page_title": "心声墙 | 澳门青少年",
+        "brand": "澳门青少年心声墙",
+        "welcome": "不必把话整理得很好。这里愿意听听你的感受，你不是一个人。",
+        "sidebar_title": "🌱 心声墙",
+        "sidebar_subtitle": "澳门青少年 · 匿名心声",
+        "sidebar_note": "慢慢说，感受值得被听见。",
+        "privacy_note": "请保护自己和他人的隐私。",
+        "navigation": "导航",
+        "write_page": "写心声",
+        "wall_page": "心声墙",
+        "admin_page": "管理员",
+        "write_intro": "今天的开心、委屈，或还说不清的心情，都可以慢慢写。",
+        "write_privacy": (
+            "仅填写虚构示例。提交后，正文将发送至 DeepSeek 进行 AI 分析。"
+            "请勿填写真实姓名、学校、电话或其他可识别身份的信息。"
+        ),
+        "post_saved": "提交成功，心声编号 #{id}，尚未公开。",
+        "crisis_notice": (
+            "这条心声需要优先安全关注，不会公开。"
+            "本网站不是实时求助渠道，不能保证有人即时查看。"
+        ),
+        "pending_receipt": "当前状态：待人工审核。",
+        "companion_heading": "🌿 AI 陪伴回应 · 给此刻的你",
+        "companion_label": "AI 陪伴回应",
+        "private_receipt": "你没有同意匿名公开，这条心声不会展示在心声墙上。",
+        "post_label": "此刻，你想说些什么？",
+        "post_placeholder": (
+            "例如：最近温习有点累，想有人听我说说……\n"
+            "演示时，请只写虚构的感受，不留下真实姓名或学校。"
+        ),
+        "consent": "同意匿名公开",
+        "consent_note": "是否公开由你选择；同意公开后，也会先由人工审核。",
+        "submit_post": "轻轻放下",
+        "post_empty": "请先写下一点心声，再提交。",
+        "post_too_long": "心声最多支持 {limit} 个字符。",
+        "post_spinner": "正在接住你的心声……",
+        "post_save_failed": "暂时无法保存心声，文字已保留在输入框中，请稍后重试。",
+        "reaction_understand": "我懂你",
+        "reaction_hug": "抱抱",
+        "reaction_metoo": "我也是",
+        "reaction_worried": "我有点担心你",
+        "reaction_crisis": "心声 #{id} 已转入优先安全关注，暂时退出公开墙。",
+        "reaction_saved": "已为心声 #{id} 留下一份关怀。",
+        "reaction_failed": "关怀暂未保存，帖子可能已退出公开墙，请刷新后重试。",
+        "reply_label": "留下一点安慰",
+        "reply_placeholder": "一句「愿意听你说说」，也可以是一份陪伴。请只填写虚构示例。",
+        "submit_reply": "提交回复",
+        "reply_empty": "请先写下一点安慰，再提交。",
+        "reply_too_long": "回复最多支持 {limit} 个字符。",
+        "reply_spinner": "正在检查回复……",
+        "reply_save_failed": "暂时无法保存回复，输入已保留，请稍后重试。",
+        "reply_saved": "心声 #{id} 的回复已提交，等待人工审核，尚未公开。",
+        "wall_intro": "在别人的只言片语里，也许能遇见一点共鸣。",
+        "wall_privacy": (
+            "每一份感受，都值得被认真对待。"
+            "仅填写虚构示例，回复正文将发送至 DeepSeek 分析，请勿填写身份信息。"
+        ),
+        "not_realtime": "本网站不是实时求助渠道，不能保证有人即时查看。",
+        "wall_empty": "这里暂时还没有公开的心声。不着急，每一份表达都会先被认真看见。",
+        "post_meta": "匿名心声 #{id} · {time}（澳门时间）",
+        "reply_meta": "匿名回复 #{id} · {time}（澳门时间）",
+        "care_heading": "留一份关怀",
+        "replies_empty": "还没有通过审核的安慰。愿意的话，留下一句温柔的话。",
+        "wall_load_failed": "暂时无法读取心声或回复，请稍后重试。",
+        "approve": "通过",
+        "reject": "退回",
+        "admin_expired": "管理员登录已失效，请重新登录。",
+        "review_saved": "审核结果已保存。",
+        "review_stale": "该内容已被处理，请查看最新队列。",
+        "review_failed": "审核结果暂未保存，请稍后重试。",
+        "admin_disabled": "尚未配置 ADMIN_PASS，管理员入口已关闭。",
+        "admin_password": "管理员密码",
+        "login": "登录",
+        "login_failed": "密码不正确，请重试。",
+        "refresh_queue": "刷新队列",
+        "logout": "退出登录",
+        "queue_load_failed": "暂时无法读取审核队列，请稍后重试。",
+        "post_queue": "待审核心声 · {count}",
+        "post_queue_empty": "暂时没有待审核心声。",
+        "admin_post_meta": "心声 #{id} · {time}（澳门时间）",
+        "crisis_heading": "危机 · 优先安全关注",
+        "pending_heading": "待人工审核",
+        "post_details": "分类：{category} · AI 参考强度：{intensity} · 同意公开：{consent}",
+        "not_assessed": "未评估",
+        "yes": "是",
+        "no": "否",
+        "reply_queue": "待审核回复 · {count}",
+        "reply_queue_empty": "暂时没有待审核回复。",
+        "admin_reply_meta": "回复 #{id} → 心声 #{post_id} · {time}（澳门时间）",
+        "parent_crisis": "所属心声需要优先安全关注",
+        "parent_post": "所属心声",
+        "pending_reply": "待审核回复",
+        "db_init_failed": "数据库初始化失败，请检查项目文件夹是否可写后重试。",
+        "category_study": "学业",
+        "category_family": "家庭",
+        "category_social": "社交",
+        "category_feelings": "情绪",
+        "category_unknown": "未分类",
+        "help_resources": (
+            "如果你现在很难受，请联系澳门明爱生命热线 28525222，"
+            "或向信任的大人/学校社工求助。你并不孤单。"
+        ),
+        "disclaimer": "本项目为黑客松原型，使用示例数据，不收集真实个人信息，不能替代专业帮助。",
+        "validation_failed": "暂时无法处理这段文字，请保留内容并稍后重试。",
+        "invalid_post_type": "心声内容必须是文字。",
+        "invalid_consent": "公开同意选项必须是勾选或未勾选。",
+        "invalid_category": "心声分类无效。",
+        "invalid_intensity": "心声强度必须是 1 到 5 的整数。",
+        "invalid_ai_reply": "AI 回应不能为空。",
+        "invalid_new_status": "新心声必须等待人工审核或安全关注。",
+        "post_not_public": "这条心声已不在公开墙上，请刷新页面。",
+        "invalid_reaction": "无效的关怀类型。",
+        "invalid_reply_moderation": "回复审核结果无效。",
+        "invalid_review": "无效的审核操作。",
+    },
+    "en": {
+        "language": "Language",
+        "language_zh": "中文",
+        "language_en": "English",
+        "page_title": "Heart Wall | Macao Youth",
+        "brand": "Macao Youth Heart Wall",
+        "welcome": "Your words don't have to be perfect. Your feelings matter, and you're not alone.",
+        "sidebar_title": "🌱 Heart Wall",
+        "sidebar_subtitle": "Macao youth · Anonymous sharing",
+        "sidebar_note": "Take your time. Your feelings deserve to be heard.",
+        "privacy_note": "Please protect your privacy and other people's, too.",
+        "navigation": "Explore",
+        "write_page": "Share a feeling",
+        "wall_page": "Heart wall",
+        "admin_page": "Admin",
+        "write_intro": "A little joy, a difficult day, or a feeling you can't quite name. Start wherever you are.",
+        "write_privacy": (
+            "Use fictional examples only. When you send a post, its text goes to DeepSeek for AI analysis. "
+            "Please leave out real names, schools, phone numbers, or anything that could identify someone."
+        ),
+        "post_saved": "Your words have been saved as post #{id}. They are not public yet.",
+        "crisis_notice": (
+            "This post needs priority safety attention and will not be made public. "
+            "This is not a live support service, and we cannot promise an immediate response."
+        ),
+        "pending_receipt": "Waiting for a human reviewer. Not public yet.",
+        "companion_heading": "🌿 A little support from AI · For you, right now",
+        "companion_label": "A supportive AI response",
+        "private_receipt": "You haven't agreed to public sharing, so this post will stay off the heart wall.",
+        "post_label": "What's on your mind today?",
+        "post_placeholder": (
+            "For example: Studying has felt tiring lately, and I'd like someone to listen...\n"
+            "For this demo, use a fictional feeling and leave out real names and schools."
+        ),
+        "consent": "I agree to share this anonymously",
+        "consent_note": "Sharing is your choice. If you agree, a human will still review your post first.",
+        "submit_post": "Set it down here",
+        "post_empty": "Write a little about the feeling you'd like to share first.",
+        "post_too_long": "Please keep your post within {limit} characters.",
+        "post_spinner": "Taking a moment with your words...",
+        "post_save_failed": "We couldn't save your post just now. Your words are still in the box; please try again later.",
+        "reaction_understand": "I hear you",
+        "reaction_hug": "A gentle hug",
+        "reaction_metoo": "Me too",
+        "reaction_worried": "I'm concerned",
+        "reaction_crisis": "Post #{id} has moved to the priority safety queue and is no longer on the public wall.",
+        "reaction_saved": "Your care for post #{id} has been saved.",
+        "reaction_failed": "We couldn't save that gesture. The post may no longer be public; please refresh and try again.",
+        "reply_label": "Leave a little kindness",
+        "reply_placeholder": "A simple \"I'm here to listen\" can mean a lot. Use fictional examples only.",
+        "submit_reply": "Send a little kindness",
+        "reply_empty": "Write a few kind words before sending your reply.",
+        "reply_too_long": "Please keep your reply within {limit} characters.",
+        "reply_spinner": "Taking a careful look at your reply...",
+        "reply_save_failed": "We couldn't save your reply just now. Your words are still there; please try again later.",
+        "reply_saved": "Your reply to post #{id} is waiting for human review. It isn't public yet.",
+        "wall_intro": "Sometimes, a few words from someone else can help us feel less alone.",
+        "wall_privacy": (
+            "Every feeling deserves care. Use fictional examples only. "
+            "Reply text goes to DeepSeek for analysis, so please leave out identifying details."
+        ),
+        "not_realtime": "This is not a live support service. We cannot promise an immediate response.",
+        "wall_empty": "No posts are public yet. There's no rush; every post needs a human review first.",
+        "post_meta": "Anonymous post #{id} · {time} (Macao time)",
+        "reply_meta": "Anonymous reply #{id} · {time} (Macao time)",
+        "care_heading": "A small gesture of care",
+        "replies_empty": "No replies have been approved yet. A few kind words could be a gentle start.",
+        "wall_load_failed": "We couldn't load the posts or replies just now. Please try again later.",
+        "approve": "Approve",
+        "reject": "Return",
+        "admin_expired": "Your admin session has expired. Please sign in again.",
+        "review_saved": "Review saved.",
+        "review_stale": "This item has already been reviewed. Please check the latest queue.",
+        "review_failed": "The review couldn't be saved. Please try again later.",
+        "admin_disabled": "ADMIN_PASS hasn't been configured, so admin access is closed.",
+        "admin_password": "Admin password",
+        "login": "Sign in",
+        "login_failed": "That password doesn't match. Please try again.",
+        "refresh_queue": "Refresh queue",
+        "logout": "Sign out",
+        "queue_load_failed": "We couldn't load the review queue. Please try again later.",
+        "post_queue": "Posts awaiting review · {count}",
+        "post_queue_empty": "No posts are waiting for review.",
+        "admin_post_meta": "Post #{id} · {time} (Macao time)",
+        "crisis_heading": "Crisis · Priority safety attention",
+        "pending_heading": "Awaiting human review",
+        "post_details": "Category: {category} · AI intensity estimate: {intensity} · Public sharing agreed: {consent}",
+        "not_assessed": "Not assessed",
+        "yes": "Yes",
+        "no": "No",
+        "reply_queue": "Replies awaiting review · {count}",
+        "reply_queue_empty": "No replies are waiting for review.",
+        "admin_reply_meta": "Reply #{id} → Post #{post_id} · {time} (Macao time)",
+        "parent_crisis": "The parent post needs priority safety attention",
+        "parent_post": "Parent post",
+        "pending_reply": "Reply awaiting review",
+        "db_init_failed": "We couldn't open the database. Please check that the project folder is writable and try again.",
+        "category_study": "School",
+        "category_family": "Family",
+        "category_social": "Friendships",
+        "category_feelings": "Feelings",
+        "category_unknown": "Uncategorised",
+        "help_resources": (
+            "If things feel very difficult right now, please contact the Caritas Macao Life Hope Hotline "
+            "at 28525222, or reach out to a trusted adult or your school social worker. You are not alone."
+        ),
+        "disclaimer": (
+            "This is a hackathon prototype using sample data. It is not intended to collect real personal "
+            "information and cannot replace professional help."
+        ),
+        "validation_failed": "We couldn't process these words just now. Please keep a copy and try again later.",
+        "invalid_post_type": "Please write your post as text.",
+        "invalid_consent": "Please choose whether you agree to anonymous public sharing.",
+        "invalid_category": "The post's category couldn't be processed.",
+        "invalid_intensity": "The intensity estimate must be a whole number from 1 to 5.",
+        "invalid_ai_reply": "The AI response couldn't be saved because it was empty.",
+        "invalid_new_status": "A new post must wait for human review or priority safety attention.",
+        "post_not_public": "This post is no longer on the public wall. Please refresh the page.",
+        "invalid_reaction": "That gesture of care couldn't be processed.",
+        "invalid_reply_moderation": "The reply's review result couldn't be processed.",
+        "invalid_review": "That review action couldn't be processed.",
+    },
+}
+HELP_RESOURCES = TEXT["zh"]["help_resources"]
+DEMO_DISCLAIMER = TEXT["zh"]["disclaimer"]
+REACTION_TYPES = ("understand", "hug", "metoo", "worried")
+REACTION_LABELS = tuple(
+    (kind, TEXT["zh"][f"reaction_{kind}"]) for kind in REACTION_TYPES
+)
+NAVIGATION = {"写心声": "write_page", "心声墙": "wall_page", "管理员": "admin_page"}
+REACTION_ICONS = {
+    "understand": "💚", "hug": "🫂", "metoo": "🌷", "worried": "🤍",
+}
+CATEGORY_STYLES = {
+    "学业": "study", "家庭": "family", "社交": "social", "情绪": "feelings",
+}
+
+PAGE_STYLES = """
+<style>
+:root {
+    --hw-ink: #30473e;
+    --hw-muted: #63736b;
+    --hw-green: #456f5b;
+    --hw-line: #d8e2db;
+    --hw-paper: #f5f7f5;
+}
+.stApp, [data-testid="stAppViewContainer"] {
+    background: var(--hw-paper);
+    color: var(--hw-ink);
+}
+html, body, .stApp, button, input, textarea,
+[data-testid="stMarkdownContainer"], [data-testid="stText"] {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
+        "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    letter-spacing: 0;
+}
+[data-testid="stHeader"] { background: var(--hw-paper); }
+[data-testid="stMainBlockContainer"] {
+    max-width: 820px;
+    padding-top: 5rem;
+    padding-bottom: 2rem;
+}
+[data-testid="stSidebar"] {
+    background: #eef2ed;
+    border-right: 1px solid var(--hw-line);
+}
+[data-testid="stSidebar"] h1 { font-size: 1.55rem; }
+[data-testid="stSidebar"] [data-testid="stRadio"] label {
+    padding: .5rem .35rem;
+    min-height: 44px;
+    cursor: pointer;
+}
+[data-testid="stSidebar"] [data-testid="stRadio"] label:has(input:checked) {
+    background: #dee9df;
+    border-radius: 8px;
+}
+[data-testid="stRadioOption"][data-selected="true"] > div > div:first-child {
+    background: var(--hw-green);
+    border-color: var(--hw-green);
+}
+[data-testid="stCheckbox"] label[data-selected="true"] > div:first-of-type {
+    background: var(--hw-green);
+    border-color: var(--hw-green);
+}
+h1, h2, h3 { color: var(--hw-ink); letter-spacing: 0; }
+h2 { font-size: 1.5rem; font-weight: 650; }
+h3 { font-size: 1.1rem; }
+p, [data-testid="stText"] { line-height: 1.85; }
+[data-testid="stText"] {
+    font-size: 1rem;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    word-break: normal;
+}
+[data-testid="stCaptionContainer"] p {
+    color: var(--hw-muted);
+    font-size: .83rem;
+    line-height: 1.75;
+}
+.welcome {
+    padding: 0 0 1.6rem;
+    margin-bottom: .4rem;
+    border-bottom: 1px solid var(--hw-line);
+}
+.welcome .welcome-mark { font-size: 1.8rem; margin-bottom: .5rem; }
+.welcome h1 {
+    font-size: 2rem;
+    line-height: 1.45;
+    font-weight: 650;
+    padding: 0;
+    margin: 0 0 .5rem;
+    overflow-wrap: anywhere;
+}
+.welcome p { color: var(--hw-muted); margin: 0; font-size: 1rem; }
+.welcome p, .category-chip { overflow-wrap: anywhere; }
+.st-key-language [role="combobox"] {
+    border-radius: 8px;
+    color: var(--hw-ink);
+    min-height: 44px;
+}
+.st-key-navigation { margin-top: .25rem; }
+[data-testid="stTextArea"] textarea,
+[data-testid="stTextInput"] input {
+    background: #fcfdfb;
+    color: var(--hw-ink);
+    line-height: 1.8;
+    caret-color: var(--hw-green);
+}
+[data-testid="stTextArea"] [data-baseweb="textarea"],
+[data-testid="stTextInput"] [data-baseweb="input"],
+[data-testid="stTextAreaRootElement"],
+[data-testid="stTextInputRootElement"] {
+    background: #fcfdfb;
+    border: 1px solid #b7c9bd;
+    border-radius: 8px;
+}
+[data-testid="stTextArea"] [data-baseweb="textarea"]:focus-within,
+[data-testid="stTextInput"] [data-baseweb="input"]:focus-within,
+[data-testid="stTextAreaRootElement"]:focus-within,
+[data-testid="stTextInputRootElement"]:focus-within {
+    border-color: var(--hw-green);
+    box-shadow: 0 0 0 3px #dfece2;
+}
+textarea::placeholder, input::placeholder { color: #6b7b71; opacity: 1; }
+[data-testid="stCheckbox"] label { color: var(--hw-ink); }
+[data-testid="stCheckbox"] input { accent-color: var(--hw-green); }
+button[kind] {
+    border-radius: 8px;
+    min-height: 44px;
+    border-color: #c5d5c9;
+    color: var(--hw-ink);
+    background: #f9fbf8;
+    transition: background-color .15s ease, border-color .15s ease;
+}
+button[kind]:hover {
+    background: #e8f0e8;
+    border-color: var(--hw-green);
+    color: var(--hw-ink);
+}
+button[kind="primary"], button[kind="primaryFormSubmit"] {
+    background: var(--hw-green);
+    border-color: var(--hw-green);
+    color: #fff;
+    padding-inline: 1.25rem;
+}
+button[kind="primary"]:hover, button[kind="primaryFormSubmit"]:hover {
+    background: #355744;
+    border-color: #355744;
+    color: #fff;
+}
+button:focus-visible, a:focus-visible {
+    outline: 3px solid #6f9e84;
+    outline-offset: 3px;
+}
+[data-testid="stVerticalBlockBorderWrapper"] {
+    border-color: var(--hw-line);
+    border-radius: 8px;
+}
+div[class*="st-key-heart_post_"] {
+    background: #fcfdfb;
+    border: 1px solid var(--hw-line);
+    border-radius: 8px;
+    padding: 1.4rem;
+    margin-bottom: 1.1rem;
+    box-shadow: 0 2px 8px #32483b06;
+}
+div[class*="st-key-heart_post_"] [data-testid="stHorizontalBlock"] {
+    gap: .6rem;
+    flex-wrap: nowrap;
+}
+div[class*="st-key-heart_post_"] [data-testid="stColumn"] {
+    min-width: 0;
+    flex: 1 1 0;
+}
+div[class*="st-key-heart_post_"] button {
+    min-height: 46px;
+    font-size: .88rem;
+    padding: .5rem .45rem;
+}
+div[class*="st-key-heart_post_"] button p {
+    font-size: .88rem;
+    line-height: 1.5;
+    white-space: normal;
+    overflow-wrap: anywhere;
+}
+.st-key-companion_reply {
+    background: #eaf2f5;
+    border: 1px solid #ccdee5;
+    border-left: 4px solid #8bb3bf;
+    border-radius: 8px;
+    padding: 1.15rem 1.3rem;
+    margin: .25rem 0 .75rem;
+}
+.category-chip {
+    display: inline-flex;
+    align-items: center;
+    padding: .2rem .65rem;
+    border-radius: 6px;
+    font-size: .8rem;
+    font-weight: 600;
+    line-height: 1.6;
+    background: #e8eee9;
+    color: #405c4c;
+}
+.category-chip.study { background: #e8f0f5; color: #3d6074; }
+.category-chip.family { background: #f3eaf0; color: #76526a; }
+.category-chip.social { background: #e6efe7; color: #40694d; }
+.category-chip.feelings { background: #f7edde; color: #796036; }
+[data-testid="stAlert"] {
+    border-radius: 8px;
+    padding: 1rem 1.1rem;
+    line-height: 1.8;
+}
+[data-testid="stAlert"]:has([data-testid="stAlertContentError"]) {
+    background: #f7eeee;
+    border: 1px solid #dfbdbd;
+    color: #794747;
+}
+[data-testid="stAlertContentError"] { color: #794747; }
+[data-testid="stAlert"] [data-testid="stAlertContainer"],
+[data-testid="stAlert"] [data-testid^="stAlertContent"] {
+    background: transparent;
+    border: 0;
+    padding: 0;
+    color: inherit;
+}
+[data-testid="stAlert"]:has([data-testid="stAlertContentSuccess"]) {
+    background: #e8f1e8;
+    color: #345c42;
+}
+[data-testid="stAlert"]:has([data-testid="stAlertContentWarning"]) {
+    background: #f8f1e3;
+    border: 1px solid #e0d1b2;
+    color: #705a2d;
+}
+[data-testid="stAlert"]:has([data-testid="stAlertContentInfo"]) {
+    background: #eaf2f5;
+    border: 1px solid #ccdee5;
+    color: #3e6170;
+}
+[data-testid="stElementContainer"]:has(.support-anchor) { display: none; }
+[data-testid="stVerticalBlock"]:has(
+    > [data-testid="stElementContainer"] .support-anchor
+) [data-testid="stAlert"] {
+    background: #fbf0dc;
+    border: 1px solid #ddc58b;
+    border-left: 4px solid #b48d42;
+}
+[data-testid="stVerticalBlock"]:has(
+    > [data-testid="stElementContainer"] .support-anchor
+) [data-testid="stAlert"] * { color: #705520; }
+hr { border-color: var(--hw-line); margin: .75rem 0; }
+@media (max-width: 640px) {
+    [data-testid="stMainBlockContainer"] {
+        padding: 5rem 1rem 1.5rem;
+    }
+    .welcome { padding-bottom: 1.2rem; }
+    .welcome h1 { font-size: 1.6rem; }
+    .welcome p { font-size: .95rem; }
+    div[class*="st-key-heart_post_"] { padding: 1rem; }
+    .st-key-companion_reply { padding: 1rem; }
+    [data-testid="stText"] { font-size: .95rem; }
+}
+@media (max-width: 360px) {
+    div[class*="st-key-heart_post_"] [data-testid="stHorizontalBlock"] button {
+        min-height: 64px;
+    }
+}
+@media (prefers-reduced-motion: reduce) {
+    button[kind] { transition: none; }
+}
+</style>
+"""
+
+
+def apply_page_style() -> None:
+    st.markdown(PAGE_STYLES, unsafe_allow_html=True)
+
+
+def current_language() -> str:
+    return "en" if st.session_state.get("language") == "en" else "zh"
+
+
+def t(key: str, **values: object) -> str:
+    return TEXT[current_language()][key].format(**values)
+
+
+def category_label(category: str | None) -> str:
+    style = CATEGORY_STYLES.get(category or "", "unknown")
+    return t(f"category_{style}")
+
+
+def validation_message(error: ValueError) -> str:
+    message = str(error)
+    # Translate known storage errors without changing the database module.
+    for key in (
+        "post_empty", "post_too_long", "reply_empty", "reply_too_long",
+        "invalid_post_type", "invalid_consent", "invalid_category",
+        "invalid_intensity", "invalid_ai_reply", "invalid_new_status",
+        "post_not_public", "invalid_reaction", "invalid_reply_moderation",
+        "invalid_review",
+    ):
+        if message in (
+            TEXT["zh"][key].format(limit=MAX_CONTENT_LENGTH),
+            TEXT["en"][key].format(limit=MAX_CONTENT_LENGTH),
+        ):
+            return t(key, limit=MAX_CONTENT_LENGTH)
+    return message if current_language() == "zh" else t("validation_failed")
+
+
+def show_welcome() -> None:
+    st.markdown(
+        '<section class="welcome">'
+        '<div class="welcome-mark" aria-hidden="true">🌱</div>'
+        f'<h1>{escape(t("brand"))}</h1>'
+        f'<p>{escape(t("welcome"))}</p>'
+        '</section>',
+        unsafe_allow_html=True,
+    )
+
+
+def show_category(category: str | None) -> None:
+    # Only fixed labels enter HTML; posts and replies still use literal st.text.
+    label = category_label(category)
+    style = CATEGORY_STYLES.get(category or "", "")
+    st.markdown(
+        f'<span class="category-chip {style}">{escape(label)}</span>',
+        unsafe_allow_html=True,
+    )
+
+
+def show_help_resources() -> None:
+    with st.container():
+        st.markdown('<span class="support-anchor" aria-hidden="true"></span>',
+                    unsafe_allow_html=True)
+        st.error(t("help_resources"))
+
+
+def format_time(value: str) -> str:
+    return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(
+        MACAU_TIMEZONE
+    ).strftime("%Y-%m-%d %H:%M")
+
+
+def write_post_page() -> None:
+    st.subheader(t("write_page"))
+    st.markdown(t("write_intro"))
+    st.caption(t("write_privacy"))
+
+    receipt = st.session_state.pop("_post_receipt", None)
+    if receipt is not None:
+        # Reset form widgets before rendering them, and only after a saved post.
+        st.session_state["draft_content"] = ""
+        st.session_state["consent_public"] = False
+        st.success(t("post_saved", id=receipt["id"]))
+        if receipt["status"] == "crisis":
+            st.warning(t("crisis_notice"))
+            show_help_resources()
+        else:
+            st.caption(t("pending_receipt"))
+        with st.container(border=False, key="companion_reply"):
+            st.caption(t("companion_heading"))
+            st.text(receipt["ai_reply"])
+        if not receipt["consent_public"]:
+            st.caption(t("private_receipt"))
+
+    with st.form("new_post", clear_on_submit=False, border=False):
+        content = st.text_area(
+            t("post_label"),
+            height=200,
+            max_chars=MAX_CONTENT_LENGTH,
+            key="draft_content",
+            placeholder=t("post_placeholder"),
+        )
+        consent_public = st.checkbox(t("consent"), key="consent_public")
+        st.caption(t("consent_note"))
+        submitted = st.form_submit_button(
+            t("submit_post"), type="primary", icon="🌱", key="submit_post"
+        )
+
+    if submitted:
+        try:
+            if not normalize_text(content):
+                raise ValueError(t("post_empty"))
+            if len(content.strip()) > MAX_CONTENT_LENGTH:
+                raise ValueError(t("post_too_long", limit=MAX_CONTENT_LENGTH))
+            with st.spinner(t("post_spinner")):
+                analysis = analyze_post(content, language=current_language())
+                status = (
+                    "crisis"
+                    if analysis["moderation"] == "crisis" or analysis["intensity"] >= 4
+                    else "pending"
+                )
+                post_id = create_post(
+                    content, consent_public,
+                    category=analysis["category"],
+                    intensity=analysis["intensity"],
+                    ai_reply=analysis["ai_reply"],
+                    status=status,
+                )
+        except ValueError as error:
+            st.error(validation_message(error))
+        except sqlite3.Error:
+            st.error(t("post_save_failed"))
+        else:
+            st.session_state["_post_receipt"] = {
+                "id": post_id,
+                "consent_public": consent_public,
+                "status": status,
+                "ai_reply": analysis["ai_reply"],
+            }
+            st.rerun()
+
+
+def reaction_buttons(post_id: int, counts: dict[str, int]) -> None:
+    for offset in (0, 2):
+        columns = st.columns(2)
+        for column, reaction_type in zip(
+            columns, REACTION_TYPES[offset:offset + 2]
+        ):
+            if column.button(
+                f"{t(f'reaction_{reaction_type}')} · {counts[reaction_type]}",
+                key=f"reaction_{post_id}_{reaction_type}",
+                icon=REACTION_ICONS[reaction_type],
+                width="stretch",
+                wrap=True,
+            ):
+                try:
+                    crisis = add_reaction(post_id, reaction_type)
+                    st.session_state["_wall_notice"] = {
+                        "message": (
+                            t("reaction_crisis", id=post_id)
+                            if crisis else t("reaction_saved", id=post_id)
+                        ),
+                        "help": crisis,
+                    }
+                except (ValueError, sqlite3.Error):
+                    st.session_state["_wall_notice"] = {
+                        "message": t("reaction_failed"),
+                        "error": True,
+                    }
+                st.rerun()
+
+
+def reply_form(post_id: int) -> None:
+    draft_key = f"reply_draft_{post_id}"
+    with st.form(f"reply_form_{post_id}", clear_on_submit=False, border=False):
+        content = st.text_area(
+            t("reply_label"),
+            key=draft_key,
+            max_chars=MAX_CONTENT_LENGTH,
+            height=100,
+            placeholder=t("reply_placeholder"),
+        )
+        submitted = st.form_submit_button(
+            t("submit_reply"), icon="💌",
+            # Keep the existing widget identity in both languages.
+            key=f"FormSubmitter:reply_form_{post_id}-提交回复",
+        )
+    if submitted:
+        try:
+            if not normalize_text(content):
+                raise ValueError(t("reply_empty"))
+            if len(content.strip()) > MAX_CONTENT_LENGTH:
+                raise ValueError(t("reply_too_long", limit=MAX_CONTENT_LENGTH))
+            with st.spinner(t("reply_spinner")):
+                analysis = analyze_post(content, language=current_language())
+                create_reply(post_id, content, moderation=analysis["moderation"])
+        except ValueError as error:
+            st.error(validation_message(error))
+        except sqlite3.Error:
+            st.error(t("reply_save_failed"))
+        else:
+            st.session_state["_clear_reply_draft"] = draft_key
+            st.session_state["_wall_notice"] = {
+                "message": t("reply_saved", id=post_id),
+                "help": analysis["moderation"] == "crisis",
+            }
+            st.rerun()
+
+
+def wall_page() -> None:
+    st.subheader(t("wall_page"))
+    st.markdown(t("wall_intro"))
+    st.caption(t("wall_privacy"))
+    clear_key = st.session_state.pop("_clear_reply_draft", None)
+    if clear_key:
+        st.session_state[clear_key] = ""
+    notice = st.session_state.pop("_wall_notice", None)
+    if notice:
+        if notice.get("error"):
+            st.error(notice["message"])
+        else:
+            st.success(notice["message"])
+        if notice.get("help"):
+            show_help_resources()
+            st.caption(t("not_realtime"))
+    try:
+        posts = get_approved_posts()
+        if not posts:
+            st.info(t("wall_empty"))
+        for post in posts:
+            counts = get_reaction_counts(post["id"])
+            replies = get_approved_replies(post["id"])
+            with st.container(border=True, key=f"heart_post_{post['id']}"):
+                show_category(post["category"])
+                st.caption(
+                    t("post_meta", id=post["id"], time=format_time(post["created_at"]))
+                )
+                st.text(post["content"])
+                if (post["intensity"] or 0) >= 4 or counts["worried"] >= 3:
+                    show_help_resources()
+                st.caption(t("care_heading"))
+                reaction_buttons(post["id"], counts)
+                st.divider()
+                for reply in replies:
+                    st.caption(
+                        t("reply_meta", id=reply["id"], time=format_time(reply["created_at"]))
+                    )
+                    st.text(reply["content"])
+                if not replies:
+                    st.caption(t("replies_empty"))
+                reply_form(post["id"])
+    except sqlite3.Error:
+        st.error(t("wall_load_failed"))
+
+
+def admin_authenticated() -> bool:
+    expected = os.environ.get("ADMIN_PASS", "")
+    token = st.session_state.get("_admin_token")
+    return (
+        bool(expected.strip())
+        and isinstance(token, bytes)
+        and hmac.compare_digest(
+            token, hashlib.sha256(expected.encode("utf-8")).digest()
+        )
+    )
+
+
+def check_admin_password() -> None:
+    entered = st.session_state.pop("admin_password", "")
+    expected = os.environ.get("ADMIN_PASS", "")
+    if expected.strip() and hmac.compare_digest(
+        entered.encode("utf-8"), expected.encode("utf-8")
+    ):
+        st.session_state["_admin_token"] = hashlib.sha256(
+            expected.encode("utf-8")
+        ).digest()
+        st.session_state.pop("_admin_login_error", None)
+    else:
+        st.session_state.pop("_admin_token", None)
+        st.session_state["_admin_login_error"] = True
+
+
+def logout_admin() -> None:
+    for key in ("_admin_token", "_admin_login_error", "_admin_notice"):
+        st.session_state.pop(key, None)
+
+
+def review_buttons(kind: str, item_id: int) -> None:
+    columns = st.columns(2)
+    approved = columns[0].button(
+        t("approve"), key=f"approve_{kind}_{item_id}", type="primary"
+    )
+    rejected = columns[1].button(t("reject"), key=f"reject_{kind}_{item_id}")
+    if approved or rejected:
+        if not admin_authenticated():
+            st.error(t("admin_expired"))
+            return
+        try:
+            changed = review_item(
+                kind, item_id, "approved" if approved else "rejected"
+            )
+            st.session_state["_admin_notice"] = {
+                "message": t("review_saved") if changed else t("review_stale")
+            }
+        except (ValueError, sqlite3.Error):
+            st.session_state["_admin_notice"] = {
+                "message": t("review_failed"),
+                "error": True,
+            }
+        st.rerun()
+
+
+def admin_page() -> None:
+    st.title(t("admin_page"))
+    if not os.environ.get("ADMIN_PASS", "").strip():
+        logout_admin()
+        st.warning(t("admin_disabled"))
+        return
+    if not admin_authenticated():
+        st.session_state.pop("_admin_token", None)
+        with st.form("admin_login"):
+            st.text_input(t("admin_password"), type="password", key="admin_password")
+            st.form_submit_button(
+                t("login"), on_click=check_admin_password, key="admin_login_submit"
+            )
+        if st.session_state.get("_admin_login_error"):
+            st.error(t("login_failed"))
+        return
+
+    columns = st.columns(2)
+    if columns[0].button(t("refresh_queue"), key="refresh_admin"):
+        st.rerun()
+    columns[1].button(t("logout"), key="logout_admin", on_click=logout_admin)
+    notice = st.session_state.pop("_admin_notice", None)
+    if notice:
+        if notice.get("error"):
+            st.error(notice["message"])
+        else:
+            st.success(notice["message"])
+    try:
+        posts = get_review_posts()
+        replies = get_review_replies()
+    except sqlite3.Error:
+        st.error(t("queue_load_failed"))
+        return
+
+    st.subheader(t("post_queue", count=len(posts)))
+    if not posts:
+        st.info(t("post_queue_empty"))
+    for post in posts:
+        with st.container(border=True):
+            st.caption(
+                t("admin_post_meta", id=post["id"], time=format_time(post["created_at"]))
+            )
+            if post["status"] == "crisis":
+                st.error(t("crisis_heading"))
+                show_help_resources()
+            else:
+                st.caption(t("pending_heading"))
+            st.text(post["content"])
+            st.caption(
+                t(
+                    "post_details", category=category_label(post["category"]),
+                    intensity=post["intensity"] or t("not_assessed"),
+                    consent=t("yes") if post["consent_public"] else t("no"),
+                )
+            )
+            if post["ai_reply"]:
+                st.caption(t("companion_label"))
+                st.text(post["ai_reply"])
+            review_buttons("post", post["id"])
+
+    st.subheader(t("reply_queue", count=len(replies)))
+    if not replies:
+        st.info(t("reply_queue_empty"))
+    for reply in replies:
+        with st.container(border=True):
+            st.caption(
+                t(
+                    "admin_reply_meta", id=reply["id"], post_id=reply["post_id"],
+                    time=format_time(reply["created_at"]),
+                )
+            )
+            if reply["post_status"] == "crisis":
+                st.error(t("parent_crisis"))
+            st.caption(t("parent_post"))
+            st.text(reply["post_content"])
+            st.caption(t("pending_reply"))
+            st.text(reply["content"])
+            review_buttons("reply", reply["id"])
+
+
+def main() -> None:
+    st.session_state.setdefault("language", "zh")
+    if st.session_state["language"] not in ("zh", "en"):
+        st.session_state["language"] = "zh"
+    st.set_page_config(
+        page_title=t("page_title"), page_icon="🌱", layout="centered"
+    )
+    apply_page_style()
+    try:
+        init_db()
+    except sqlite3.Error:
+        st.error(t("db_init_failed"))
+        st.stop()
+
+    with st.sidebar:
+        st.selectbox(
+            t("language"), ("zh", "en"), key="language",
+            format_func=lambda value: TEXT["zh"][f"language_{value}"],
+        )
+        st.title(t("sidebar_title"))
+        st.caption(t("sidebar_subtitle"))
+        navigation_labels = {value: t(key) for value, key in NAVIGATION.items()}
+        page = st.radio(
+            t("navigation"), tuple(NAVIGATION), key="navigation",
+            format_func=navigation_labels.__getitem__,
+            label_visibility="collapsed",
+        )
+        st.divider()
+        st.markdown(t("sidebar_note"))
+        st.caption(t("privacy_note"))
+
+    if page != "管理员":
+        show_welcome()
+    if page == "写心声":
+        write_post_page()
+    elif page == "心声墙":
+        wall_page()
+    else:
+        admin_page()
+    st.divider()
+    st.caption(t("disclaimer"))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.env.*
+.streamlit/secrets.toml
+*.db
+*.sqlite
+*.sqlite3
+.DS_Store
+
+# Local agent/editor skills and bundled tooling
+.agents/
+.claude/
+work/typecheck_tools/
